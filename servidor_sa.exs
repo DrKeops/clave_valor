@@ -3,12 +3,12 @@ Code.require_file("#{__DIR__}/debug.exs")
 defmodule ServidorSA do
                 
     defstruct primario: :undefined, copia: :undefined, servidor_gv: :undefined, 
-    			nv_conocido: 0, bbdd: Map.new()
+    			nv_conocido: 0, bbdd: Map.new(), esperando_copiar: false
 
 
     @intervalo_latido 50
 
-    @intentos 2
+    @depuracion false
 
     defp struct_inicial() do
         %ServidorSA{}
@@ -95,6 +95,8 @@ defmodule ServidorSA do
     #ESTADO PRIMARIO
 
     defp bucle_recepcion_primario(estado) do
+
+    	backup? = not estado.esperando_copiar
         estado = receive do
 
         	:envia_latido ->
@@ -105,20 +107,22 @@ defmodule ServidorSA do
             {:vista_tentativa, vista, valida} ->
             	copia_ant = estado.copia
             	estado = actualizar_estado_vt(estado,vista,valida)
-            	if(estado.copia != copia_ant && estado.copia != :undefined) do
-            		send({:servidor_sa, estado.copia},{:copia_backup, 
-            			estado.bbdd, Node.self()})
-	            	estado_copiar(estado)
+            	if((estado.copia != copia_ant || 
+            		estado.esperando_copiar == true ) &&
+            		 estado.copia != :undefined) do
+
+	            	estado_copiar( %{estado | esperando_copiar: true})
+	            else estado
 	            end
-	            estado
+	            
 
             # Solicitudes de lectura y escritura de clientes del servicio almace
-            {op, param, nodo_origen}  ->
+            {op, param, nodo_origen} when (backup?) ->
             	if(op == :lee) do
             		procesar_lectura(estado, param, nodo_origen)
             	end
             	if(op == :escribe_generico) do
-            		estado_escribir(estado, param, nodo_origen, @intentos)
+            		estado_escribir(estado, param, nodo_origen)
             	else estado	
             	end
 
@@ -142,24 +146,25 @@ defmodule ServidorSA do
             {:vista_tentativa, vista, valida} ->
             	estado = actualizar_estado_vt(estado,vista,valida)
             	if(Node.self() == estado.primario) do
-            		if(estado.copia != :undefined) do
-            			send({:servidor_sa, estado.copia},{:copia_backup, 
-            				estado.bbdd, Node.self()})
-	            		estado_copiar(estado)
+            		estado = if(estado.copia != :undefined) do
+	            		estado_copiar( %{estado | esperando_copiar: true})
+	            	else estado
             		end
             		bucle_recepcion_primario(estado)
+            	else estado
             	end
-            	estado
 
 
             {:copia_escribe, param, nodo_origen} ->
            		estado = procesar_escritura_cp(estado,param)
            		send({:servidor_sa, nodo_origen},:ok_escritura)
+           		if @depuracion do Debug.msg("copia_ecribe",estado) end
            		estado
 
             {:copia_backup, bbdd, nodo_origen} ->
             	estado = procesar_backup(estado, bbdd)
             	send({:servidor_sa, nodo_origen},:ok_backup)
+            	if @depuracion do Debug.msg("backup", estado) end
             	estado
             
             # Solicitudes de lectura y escritura de clientes del servicio almace
@@ -177,25 +182,19 @@ defmodule ServidorSA do
 
     #ESTADO ESCRIBIR
 
-    defp estado_escribir(estado, param, nodo_cliente, n) do
-
-    	IO.inspect(n)
+    defp estado_escribir(estado, param, nodo_cliente) do
 
     	send({:servidor_sa, estado.copia},{:copia_escribe, param, Node.self()})
 
     	receive do
             :ok_escritura -> 
-            	estado = procesar_escritura_ppl(estado,param, nodo_cliente)
-            	bucle_recepcion_primario(estado)
+            	procesar_escritura_ppl(estado,param, nodo_cliente)
 
             :no_soy_copia_valido -> 
-				bucle_recepcion_primario(estado)            	
+				estado         	
 
             after @intervalo_latido->  
-            	if(n > 1) do
-           			estado_escribir(estado, param, nodo_cliente, n-1)
-        		else estado
-        		end
+            	estado
         end
     end
 
@@ -203,10 +202,12 @@ defmodule ServidorSA do
 
     defp estado_copiar(estado) do
 
-    	receive do
+    	send({:servidor_sa, estado.copia},{:copia_backup, estado.bbdd, 
+    		Node.self()})
 
+    	receive do
             :ok_backup -> 
-            	estado
+            	%{estado | esperando_copiar: false}
 
             after @intervalo_latido->  
             	estado
@@ -244,6 +245,7 @@ defmodule ServidorSA do
     	end
     	
     	send({:cliente_sa, nodo_origen}, {:resultado, result})
+    	if @depuracion do Debug.msg("primario_escribe",estado) end
     	estado
         
     end
