@@ -8,6 +8,8 @@ defmodule ServidorSA do
 
     @intervalo_latido 50
 
+    @intentos 2
+
     defp struct_inicial() do
         %ServidorSA{}
     end
@@ -73,9 +75,13 @@ defmodule ServidorSA do
             	end
             	estado
 
+            {:copia_escribe, _param, nodo_origen} ->
+           		send({:cliente_sa, nodo_origen}, :no_soy_copia_valido)
+            	estado
+
             # Solicitudes de lectura y escritura de clientes del servicio almace
-            {_op, _param, _nodo_origen}  ->
-            	send({:cliente_sa, estado.servidor_gv}, {:resultado, 
+            {_op, _param, nodo_origen}  ->
+            	send({:cliente_sa, nodo_origen}, {:resultado, 
             		:no_soy_primario_valido})
             	estado
 
@@ -112,9 +118,7 @@ defmodule ServidorSA do
             		procesar_lectura(estado, param, nodo_origen)
             	end
             	if(op == :escribe_generico) do
-            		send({:servidor_sa, estado.copia},{:copia_escribe, 
-            			param, Node.self()})
-	            	estado_escribir(estado, param, nodo_origen)
+            		estado_escribir(estado, param, nodo_origen, @intentos)
             	else estado	
             	end
 
@@ -151,18 +155,16 @@ defmodule ServidorSA do
             {:copia_escribe, param, nodo_origen} ->
            		estado = procesar_escritura_cp(estado,param)
            		send({:servidor_sa, nodo_origen},:ok_escritura)
-           		IO.inspect(estado)
            		estado
 
             {:copia_backup, bbdd, nodo_origen} ->
             	estado = procesar_backup(estado, bbdd)
             	send({:servidor_sa, nodo_origen},:ok_backup)
-            	IO.inspect(estado)
             	estado
             
             # Solicitudes de lectura y escritura de clientes del servicio almace
-            {_op, _param, _nodo_origen}  ->
-	            send({:cliente_sa, estado.servidor_gv}, {:resultado, 
+            {_op, _param, nodo_origen}  ->
+	            send({:cliente_sa, nodo_origen}, {:resultado, 
 	            	:no_soy_primario_valido})
 	            estado
 
@@ -175,17 +177,26 @@ defmodule ServidorSA do
 
     #ESTADO ESCRIBIR
 
-    defp estado_escribir(estado, param, nodo_cliente) do
+    defp estado_escribir(estado, param, nodo_cliente, n) do
+
+    	IO.inspect(n)
+
+    	send({:servidor_sa, estado.copia},{:copia_escribe, param, Node.self()})
 
     	receive do
-
             :ok_escritura -> 
-            	procesar_escritura_ppl(estado,param, nodo_cliente)
+            	estado = procesar_escritura_ppl(estado,param, nodo_cliente)
+            	bucle_recepcion_primario(estado)
+
+            :no_soy_copia_valido -> 
+				bucle_recepcion_primario(estado)            	
 
             after @intervalo_latido->  
-            	estado
+            	if(n > 1) do
+           			estado_escribir(estado, param, nodo_cliente, n-1)
+        		else estado
+        		end
         end
-
     end
 
     #ESTADO COPIAR
@@ -220,20 +231,35 @@ defmodule ServidorSA do
     end
 
     defp procesar_escritura_ppl(estado, param,nodo_origen) do
-    	result = Map.get(estado.bbdd,elem(param,0))
-    	result = if result == nil do "" else result end
-    	estado = %{estado | bbdd: Map.update(estado.bbdd,elem(param,0),
-    		elem(param,1), fn(_) -> elem(param,1) end)}
-
+    	{estado, result} = if(elem(param,2) == false) do
+    		{%{estado | bbdd: Map.update(estado.bbdd,elem(param,0),
+    			elem(param,1), fn(_) -> elem(param,1) end)}, elem(param,1)}
+    		
+    	else
+    		result = Map.get(estado.bbdd,elem(param,0))
+    		result = if result == nil do "" else result end
+    		{%{estado | bbdd: Map.update(estado.bbdd,elem(param,0),
+    			hash(result <> elem(param,1)), 
+    			fn(_) -> hash(result <> elem(param,1)) end)}, result}
+    	end
+    	
     	send({:cliente_sa, nodo_origen}, {:resultado, result})
-    	IO.inspect(estado)
     	estado
         
     end
 
     defp procesar_escritura_cp(estado, param) do
-        %{estado | bbdd: Map.update(estado.bbdd,elem(param,0),elem(param,1),
-        	fn(_) -> elem(param,1) end)}
+    	if(elem(param,2) == false) do
+	        %{estado | bbdd: Map.update(estado.bbdd,elem(param,0),elem(param,1),
+	        	fn(_) -> elem(param,1) end)}
+	    else
+	    	result = Map.get(estado.bbdd,elem(param,0))
+    		result = if result == nil do "" else result end
+    		%{estado | bbdd: Map.update(estado.bbdd,elem(param,0),
+    			hash(result <> elem(param,1)), 
+    			fn(_) -> hash(result <> elem(param,1)) end)}
+	    end
+	    
     end
 
     defp procesar_backup(estado, bbdd) do
