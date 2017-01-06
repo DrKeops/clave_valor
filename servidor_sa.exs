@@ -3,7 +3,8 @@ Code.require_file("#{__DIR__}/debug.exs")
 defmodule ServidorSA do
                 
     defstruct primario: :undefined, copia: :undefined, servidor_gv: :undefined, 
-    			nv_conocido: 0, bbdd: Map.new(), esperando_copiar: false
+    			nv_conocido: 0, bbdd: Map.new(), duplicados: Map.new(), 
+    			esperando_copiar: false
 
 
     @intervalo_latido 50
@@ -20,7 +21,8 @@ defmodule ServidorSA do
          - Devuelve entero
     """
     def hash(string_concatenado) do
-        String.to_charlist(string_concatenado) |> :erlang.phash2
+        String.to_charlist(string_concatenado) |> :erlang.phash2 |> 
+        	Integer.to_string
     end
 
     @doc """
@@ -67,6 +69,9 @@ defmodule ServidorSA do
 
             {:vista_tentativa, vista, valida} ->
             	estado = actualizar_estado_vt(estado,vista,valida)
+            	if(valida == false) do
+            		bucle_recepcion_principal(%{estado | nv_conocido: 0})
+            	end
             	if(Node.self() == estado.primario) do
             		bucle_recepcion_primario(estado)
             	end
@@ -80,7 +85,7 @@ defmodule ServidorSA do
             	estado
 
             # Solicitudes de lectura y escritura de clientes del servicio almace
-            {_op, _param, nodo_origen}  ->
+            {_op, _num_op, _param, nodo_origen}  ->
             	send({:cliente_sa, nodo_origen}, {:resultado, 
             		:no_soy_primario_valido})
             	estado
@@ -107,6 +112,9 @@ defmodule ServidorSA do
             {:vista_tentativa, vista, valida} ->
             	copia_ant = estado.copia
             	estado = actualizar_estado_vt(estado,vista,valida)
+            	if(valida == false) do
+            		bucle_recepcion_principal(%{estado | nv_conocido: 0})
+            	end
             	if((estado.copia != copia_ant || 
             		estado.esperando_copiar == true ) &&
             		 estado.copia != :undefined) do
@@ -117,13 +125,21 @@ defmodule ServidorSA do
 	            
 
             # Solicitudes de lectura y escritura de clientes del servicio almace
-            {op, param, nodo_origen} when (backup?) ->
-            	if(op == :lee) do
-            		procesar_lectura(estado, param, nodo_origen)
-            	end
-            	if(op == :escribe_generico) do
-            		estado_escribir(estado, param, nodo_origen)
-            	else estado	
+            {op, num_op, param, nodo_origen} when (backup?) ->
+            	value = Map.get(estado.duplicados,nodo_origen)
+            	if(value != nil && elem(value,0) == num_op) do
+            		send({:cliente_sa, nodo_origen},{:resultado, elem(value,1)})
+            		if @depuracion do Debug.msg("duplicado",elem(value,1)) end
+            		estado
+            	else
+            		estado = if(op == :lee) do
+            			procesar_lectura(estado, num_op, param, nodo_origen)
+            		else estado
+            		end
+            		if(op == :escribe_generico) do
+            			estado_escribir(estado, num_op, param, nodo_origen)
+            		else estado	
+            		end
             	end
 
 	        _otro ->
@@ -145,6 +161,9 @@ defmodule ServidorSA do
 
             {:vista_tentativa, vista, valida} ->
             	estado = actualizar_estado_vt(estado,vista,valida)
+            	if(valida == false) do
+            		bucle_recepcion_principal(%{estado | nv_conocido: 0})
+            	end
             	if(Node.self() == estado.primario) do
             		estado = if(estado.copia != :undefined) do
 	            		estado_copiar( %{estado | esperando_copiar: true})
@@ -155,20 +174,21 @@ defmodule ServidorSA do
             	end
 
 
-            {:copia_escribe, param, nodo_origen} ->
-           		estado = procesar_escritura_cp(estado,param)
+            {:copia_escribe, num_op, nodo_cliente, param, nodo_origen} ->
+           		estado = procesar_escritura(estado,num_op,param,nodo_cliente,
+           			:cp)
            		send({:servidor_sa, nodo_origen},:ok_escritura)
            		if @depuracion do Debug.msg("copia_ecribe",estado) end
            		estado
 
-            {:copia_backup, bbdd, nodo_origen} ->
-            	estado = procesar_backup(estado, bbdd)
+            {:copia_backup, bbdd, duplicados, nodo_origen} ->
+            	estado = procesar_backup(estado, bbdd, duplicados)
             	send({:servidor_sa, nodo_origen},:ok_backup)
             	if @depuracion do Debug.msg("backup", estado) end
             	estado
             
             # Solicitudes de lectura y escritura de clientes del servicio almace
-            {_op, _param, nodo_origen}  ->
+            {_op, _num_op, _param, nodo_origen}  ->
 	            send({:cliente_sa, nodo_origen}, {:resultado, 
 	            	:no_soy_primario_valido})
 	            estado
@@ -182,13 +202,17 @@ defmodule ServidorSA do
 
     #ESTADO ESCRIBIR
 
-    defp estado_escribir(estado, param, nodo_cliente) do
+    defp estado_escribir(estado, num_op, param, nodo_cliente) do
 
-    	send({:servidor_sa, estado.copia},{:copia_escribe, param, Node.self()})
+    	send({:servidor_sa, estado.copia},{:copia_escribe, num_op, nodo_cliente,
+    		param, Node.self()})
 
     	receive do
             :ok_escritura -> 
-            	procesar_escritura_ppl(estado,param, nodo_cliente)
+            	estado = procesar_escritura(estado, num_op, param, 
+            		nodo_cliente, :ppl)
+            	if @depuracion do Debug.msg("primario_escribe",estado) end
+            	estado
 
             :no_soy_copia_valido -> 
 				estado         	
@@ -203,7 +227,7 @@ defmodule ServidorSA do
     defp estado_copiar(estado) do
 
     	send({:servidor_sa, estado.copia},{:copia_backup, estado.bbdd, 
-    		Node.self()})
+    		estado.duplicados, Node.self()})
 
     	receive do
             :ok_backup -> 
@@ -225,13 +249,17 @@ defmodule ServidorSA do
     	end
     end
 
-    defp procesar_lectura(estado, param, nodo_origen) do
+    defp procesar_lectura(estado, num_op, param, nodo_origen) do
     	result = Map.get(estado.bbdd,param)
         result = if result == nil do "" else result end
         send({:cliente_sa, nodo_origen}, {:resultado, result})
+        estado = %{estado | duplicados: Map.update(estado.duplicados,
+        	nodo_origen, {num_op, result}, fn(_) -> {num_op, result} end)}
+        if @depuracion do Debug.msg("primario_lee",estado) end
+        estado
     end
 
-    defp procesar_escritura_ppl(estado, param,nodo_origen) do
+    defp procesar_escritura(estado, num_op, param, nodo_origen, flag) do
     	{estado, result} = if(elem(param,2) == false) do
     		{%{estado | bbdd: Map.update(estado.bbdd,elem(param,0),
     			elem(param,1), fn(_) -> elem(param,1) end)}, elem(param,1)}
@@ -244,28 +272,15 @@ defmodule ServidorSA do
     			fn(_) -> hash(result <> elem(param,1)) end)}, result}
     	end
     	
-    	send({:cliente_sa, nodo_origen}, {:resultado, result})
-    	if @depuracion do Debug.msg("primario_escribe",estado) end
-    	estado
-        
+    	if (flag == :ppl) do
+			send({:cliente_sa, nodo_origen}, {:resultado, result})
+		end
+    	%{estado | duplicados: Map.update(estado.duplicados,nodo_origen,
+        	{num_op, result}, fn(_) -> {num_op, result} end)}        
     end
 
-    defp procesar_escritura_cp(estado, param) do
-    	if(elem(param,2) == false) do
-	        %{estado | bbdd: Map.update(estado.bbdd,elem(param,0),elem(param,1),
-	        	fn(_) -> elem(param,1) end)}
-	    else
-	    	result = Map.get(estado.bbdd,elem(param,0))
-    		result = if result == nil do "" else result end
-    		%{estado | bbdd: Map.update(estado.bbdd,elem(param,0),
-    			hash(result <> elem(param,1)), 
-    			fn(_) -> hash(result <> elem(param,1)) end)}
-	    end
-	    
-    end
-
-    defp procesar_backup(estado, bbdd) do
-        %{estado | bbdd: Map.new(bbdd)}
+    defp procesar_backup(estado, bbdd, duplicados) do
+        %{estado | bbdd: Map.new(bbdd), duplicados: Map.new(duplicados)}
     end
 
 end
